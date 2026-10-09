@@ -25,9 +25,13 @@ Errors: `{"id": 1, "ok": false, "error": "bad parameters for `mix.volume`: no tr
 
 ## Methods
 
+Use `engine.execute` with its `command` field and `session.inspect` for the document. The former
+`command` / `document.inspect` method aliases and `engine.execute`'s `id` field fallback are
+not accepted. Keyboard modifiers use `cmd`, not the former `command` spelling.
+
 | Method | Params | What it does |
 |---|---|---|
-| `engine.execute` (alias `command`) | `{command, params}` | Run a command programmatically. **Never opens a dialog**; empty params use defaults or the current selection. |
+| `engine.execute` | `{command, params}` | Run a command programmatically. **Never opens a dialog**; empty params use defaults or the current selection. |
 | `engine.commands` | `{filter?}` | Every command: id, label, menu path, shortcut, params doc, enabled + reason. Includes UI-layer commands (`window.*`). |
 | `engine.parity` | `{}` | Parity report against the incumbent's menu catalog. |
 | `session.inspect` | `{detail?: "summary"|"full"}` | The document: tracks, clips (with times), inserts (+params when full), sends, routing, automation, markers, groups, busses, sources, selection, transport, undo label. |

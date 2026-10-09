@@ -3,9 +3,14 @@
 
 use super::*;
 use serde_json::json;
-use soundcraft_audio_io::{AudioBuffer, FileFormat};
-use soundcraft_model::{Clip, ClipContent, EditState, Session, SourceId, TrackId};
-use soundcraft_time::Samples;
+use soundcraft_model::{EditState, TrackId};
+
+mod playlists;
+pub use playlists::{activate_playlist, target_playlist};
+mod clip_gain;
+pub use clip_gain::{clip_db, set_clip_env};
+mod stretch;
+pub use stretch::{render_stretched, replace_clip};
 
 /// Toggle (or set from `value`) a flag in `edit.flags`; returns the new state.
 pub fn toggle_flag(e: &mut Engine, p: &Value, id: &str) -> Result<Value> {
@@ -72,117 +77,10 @@ pub fn track_key(prefix: &str, t: TrackId, name: &str) -> String {
     format!("{prefix}.{}.{name}", t.0)
 }
 
-/// The track's designated target playlist index, if valid.
-pub fn target_playlist(s: &Session, t: TrackId) -> Option<usize> {
-    let v = s.edit.values.get(&format!("playlist.target.{}", t.0)).copied()?;
-    if !v.is_finite() || v < 0.0 {
-        return None;
-    }
-    let i = v as usize;
-    s.track(t).filter(|tr| i < tr.playlists.len()).map(|_| i)
-}
-
-/// Make `idx` the active playlist, remembering the previous one for Toggle Recent Playlist.
-pub fn activate_playlist(s: &mut Session, t: TrackId, idx: usize) -> bool {
-    let Some(tr) = s.track_mut(t) else { return false };
-    if idx >= tr.playlists.len() || idx == tr.active_playlist {
-        return false;
-    }
-    let prev = tr.active_playlist;
-    tr.active_playlist = idx;
-    s.edit.values.insert(format!("playlist.recent.{}", t.0), prev as f64);
-    true
-}
-
-/// Interpolated value of a `(offset, dB)` envelope (0 when empty), like the model's clip gain.
-pub fn env_db(env: &[(Samples, f32)], at: Samples) -> f32 {
-    let mut prev: Option<(Samples, f32)> = None;
-    for &(t, v) in env {
-        if t >= at {
-            return match prev {
-                Some((pt, pv)) if t > pt => pv + (v - pv) * ((at - pt) as f32 / (t - pt) as f32),
-                _ => v,
-            };
-        }
-        prev = Some((t, v));
-    }
-    prev.map_or(0.0, |(_, v)| v)
-}
-
-/// Absolute clip gain (static gain + envelope) in dB at `rel` samples from the clip start.
-pub fn clip_db(c: &Clip, rel: Samples) -> f32 {
-    c.gain_db + if c.gain_env.is_empty() { 0.0 } else { env_db(&c.gain_env, rel) }
-}
-
-/// Replace a clip's gain with an absolute envelope (sorted, deduplicated, clamped).
-pub fn set_clip_env(c: &mut Clip, mut pts: Vec<(Samples, f32)>) {
-    pts.retain(|(o, v)| *o >= 0 && *o <= c.length && v.is_finite());
-    pts.sort_by_key(|p| p.0);
-    pts.dedup_by_key(|p| p.0);
-    for p in &mut pts {
-        p.1 = p.1.clamp(-144.0, 36.0);
-    }
-    c.gain_db = 0.0;
-    let flat = pts.windows(2).all(|w| w.first().map(|a| a.1) == w.get(1).map(|b| b.1));
-    if flat {
-        c.gain_db = pts.first().map_or(0.0, |p| p.1);
-        c.gain_env.clear();
-    } else {
-        c.gain_env = pts;
-    }
-}
-
-/// Longest audio we render in one stretch (one hour at the session rate).
-fn max_render(s: &Session) -> Samples {
-    s.sample_rate.samples(3600.0)
-}
-
-/// Render the audio a clip plays, time-stretched (pitch preserved) to `out_len` samples, into a new
-/// source. Returns `Ok(None)` for MIDI clips or missing audio.
-pub fn render_stretched(s: &mut Session, cmd: &str, c: &Clip, out_len: Samples) -> Result<Option<SourceId>> {
-    let ClipContent::Audio { source, offset } = c.content else { return Ok(None) };
-    let Some(audio) = s.pool.get(source).cloned() else { return Ok(None) };
-    if out_len <= 0 || out_len > max_render(s) {
-        return Err(bad(cmd, "the target length must be between 1 sample and one hour"));
-    }
-    let stretch = if c.stretch.is_finite() && c.stretch > 0.0 { c.stretch } else { 1.0 };
-    let src_len = ((c.length as f64) / stretch).round().max(1.0);
-    let ratio = out_len as f64 / src_len;
-    if !(0.1..=10.0).contains(&ratio) {
-        return Err(bad(cmd, format!("stretch ratio {ratio:.3} is outside 0.1..10")));
-    }
-    let a = usize::try_from(offset.max(0)).unwrap_or(0);
-    let n = src_len as usize;
-    let ch: Vec<Vec<f32>> = audio
-        .buffer
-        .channels
-        .iter()
-        .map(|x| {
-            let mut v: Vec<f32> = x.iter().skip(a).take(n).copied().collect();
-            v.resize(n, 0.0);
-            v
-        })
-        .collect();
-    let sr = s.sample_rate;
-    let mut out = soundcraft_dsp::offline::time_stretch(&ch, ratio, sr.as_f64() as f32);
-    let want = usize::try_from(out_len).unwrap_or(0);
-    for o in &mut out {
-        o.resize(want, 0.0);
-    }
-    let buf = AudioBuffer { sample_rate: sr.hz(), channels: out };
-    Ok(Some(crate::io::add_source(s, &format!("{}-TCE", c.name), buf, None, FileFormat::Wav)))
-}
-
-/// Replace clip `old` on track `t` with `new` (overwriting whatever `new` covers).
-pub fn replace_clip(s: &mut Session, t: TrackId, old: soundcraft_model::ClipId, new: Clip) {
-    if let Some(pl) = s.track_mut(t).and_then(|tr| tr.playlist_mut()) {
-        pl.clips.retain(|c| c.id != old);
-    }
-    crate::edit::place_clip(s, t, new);
-}
-
 #[cfg(test)]
 mod tests {
+    use super::clip_gain::env_db;
+
     use super::*;
 
     #[test]

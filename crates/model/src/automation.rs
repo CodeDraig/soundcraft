@@ -135,7 +135,6 @@ pub struct AutomationPoint {
 pub struct AutomationLane {
     pub param: AutoParam,
     pub points: Vec<AutomationPoint>,
-    #[serde(default)]
     pub enabled: bool,
 }
 

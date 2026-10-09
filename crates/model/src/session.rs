@@ -4,7 +4,12 @@ use crate::{
     Bus, BusId, ChannelFormat, Clip, ClipId, Group, GroupId, MarkerId, MarkerKind, MemoryLocation, OutputPath, Source, SourceId, SourcePool,
     TRACK_COLORS, Track, TrackId, TrackKind, VideoSource,
 };
-use soundcraft_time::{FrameRate, GridValue, Range, SampleRate, Samples, TempoMap, TimeFormat};
+use soundcraft_time::{FrameRate, SampleRate, Samples, TempoMap};
+
+mod edit_state;
+pub use edit_state::{EditMode, EditState, Tool, TrackView, ZoomState};
+
+mod json;
 
 /// Native session file extension.
 pub const SESSION_EXTENSION: &str = "scraft";
@@ -13,7 +18,7 @@ pub const SESSION_EXTENSION: &str = "scraft";
 pub enum SessionError {
     #[error("not a SoundCraft session: {0}")]
     Format(String),
-    #[error("session file version {0} is newer than this SoundCraft supports")]
+    #[error("unsupported session file version {0}")]
     Version(u32),
     #[error("{0}")]
     Invalid(String),
@@ -28,254 +33,6 @@ pub enum BitDepthSetting {
     Float32,
 }
 
-/// Edit modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
-pub enum EditMode {
-    Shuffle,
-    #[default]
-    Slip,
-    Spot,
-    Grid,
-    /// Relative grid: moves keep their offset from the grid.
-    GridRelative,
-}
-
-impl EditMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            EditMode::Shuffle => "SHUFFLE",
-            EditMode::Slip => "SLIP",
-            EditMode::Spot => "SPOT",
-            EditMode::Grid => "GRID",
-            EditMode::GridRelative => "REL GRID",
-        }
-    }
-    pub fn from_id(s: &str) -> Option<EditMode> {
-        match s.to_ascii_lowercase().as_str() {
-            "shuffle" => Some(EditMode::Shuffle),
-            "slip" => Some(EditMode::Slip),
-            "spot" => Some(EditMode::Spot),
-            "grid" | "absolute_grid" => Some(EditMode::Grid),
-            "relative_grid" | "rel_grid" | "grid_relative" => Some(EditMode::GridRelative),
-            _ => None,
-        }
-    }
-    pub fn is_grid(self) -> bool {
-        matches!(self, EditMode::Grid | EditMode::GridRelative)
-    }
-}
-
-/// Edit tools.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
-pub enum Tool {
-    Zoom,
-    Trim,
-    #[default]
-    Selector,
-    Grabber,
-    Scrubber,
-    Pencil,
-    Smart,
-}
-
-impl Tool {
-    pub const ALL: [Tool; 7] = [Tool::Zoom, Tool::Trim, Tool::Selector, Tool::Grabber, Tool::Scrubber, Tool::Pencil, Tool::Smart];
-    pub fn id(self) -> &'static str {
-        match self {
-            Tool::Zoom => "zoom",
-            Tool::Trim => "trim",
-            Tool::Selector => "selector",
-            Tool::Grabber => "grabber",
-            Tool::Scrubber => "scrubber",
-            Tool::Pencil => "pencil",
-            Tool::Smart => "smart",
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            Tool::Zoom => "Zoomer",
-            Tool::Trim => "Trim",
-            Tool::Selector => "Selector",
-            Tool::Grabber => "Grabber",
-            Tool::Scrubber => "Scrubber",
-            Tool::Pencil => "Pencil",
-            Tool::Smart => "Smart Tool",
-        }
-    }
-    pub fn from_id(s: &str) -> Option<Tool> {
-        Tool::ALL.into_iter().find(|t| t.id() == s.to_ascii_lowercase())
-    }
-    /// F-key shortcut (F5..F10) like the incumbent.
-    pub fn fkey(self) -> Option<&'static str> {
-        match self {
-            Tool::Zoom => Some("F5"),
-            Tool::Trim => Some("F6"),
-            Tool::Selector => Some("F7"),
-            Tool::Grabber => Some("F8"),
-            Tool::Scrubber => Some("F9"),
-            Tool::Pencil => Some("F10"),
-            Tool::Smart => None,
-        }
-    }
-}
-
-/// Track view lanes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum TrackView {
-    Waveform,
-    Blocks,
-    Volume,
-    Pan,
-    Mute,
-}
-
-/// Horizontal zoom + scroll.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ZoomState {
-    /// Samples per pixel (point).
-    pub samples_per_px: f64,
-    /// Left edge of the visible timeline.
-    pub scroll: Samples,
-    /// Waveform vertical zoom factor.
-    pub waveform_zoom: f32,
-    /// Zoom preset memories 1..5.
-    pub presets: [f64; 5],
-}
-
-impl Default for ZoomState {
-    fn default() -> Self {
-        ZoomState { samples_per_px: 1024.0, scroll: 0, waveform_zoom: 1.0, presets: [64.0, 256.0, 1024.0, 4096.0, 16384.0] }
-    }
-}
-
-/// Edit-window state saved with the session (selection, tools, modes, view settings).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct EditState {
-    pub tool: Tool,
-    pub edit_mode: EditMode,
-    /// The edit selection (a point = insertion position).
-    pub selection: Range,
-    /// Tracks in the edit selection.
-    pub selected_tracks: Vec<TrackId>,
-    /// Clips explicitly selected (Grabber selection).
-    #[serde(default)]
-    pub selected_clips: Vec<ClipId>,
-    /// Playhead position when stopped.
-    pub playhead: Samples,
-    pub grid: GridValue,
-    pub nudge: GridValue,
-    #[serde(default = "yes")]
-    pub grid_lines: bool,
-    pub main_counter: TimeFormat,
-    pub sub_counter: Option<TimeFormat>,
-    pub zoom: ZoomState,
-    /// Visible rulers.
-    pub rulers: Vec<String>,
-    pub link_timeline_edit: bool,
-    pub link_track_edit: bool,
-    pub insertion_follows_playback: bool,
-    pub loop_playback: bool,
-    pub pre_post_roll: bool,
-    pub pre_roll: Samples,
-    pub post_roll: Samples,
-    pub tab_to_transient: bool,
-    pub automation_follows_edit: bool,
-    pub markers_follow_edit: bool,
-    pub layered_editing: bool,
-    pub mirrored_midi: bool,
-    pub click: bool,
-    pub countoff: bool,
-    pub countoff_bars: u32,
-    pub midi_merge: bool,
-    pub record_mode: String,
-    pub loop_record: bool,
-    pub quickpunch: bool,
-    pub scrolling: String,
-    pub solo_mode: String,
-    pub pre_fader_metering: bool,
-    pub delay_compensation: bool,
-    pub keyboard_focus: String,
-    /// Timeline selection when it is unlinked from the edit selection.
-    pub timeline_selection: Range,
-    /// Generic on/off view and option flags keyed by id (e.g. `view.clip.name`, `waveform.rectified`,
-    /// `options.midi_thru`). Saved with the session so every view setting persists.
-    #[serde(default)]
-    pub flags: std::collections::BTreeSet<String>,
-    /// Numeric settings keyed by id (e.g. `click.volume_db`, `engine.buffer_size`).
-    #[serde(default)]
-    pub values: std::collections::BTreeMap<String, f64>,
-}
-
-impl EditState {
-    pub fn flag(&self, id: &str) -> bool {
-        self.flags.contains(id)
-    }
-    pub fn set_flag(&mut self, id: &str, on: bool) {
-        if on {
-            self.flags.insert(id.to_string());
-        } else {
-            self.flags.remove(id);
-        }
-    }
-    pub fn value(&self, id: &str, default: f64) -> f64 {
-        self.values.get(id).copied().filter(|v| v.is_finite()).unwrap_or(default)
-    }
-}
-
-fn yes() -> bool {
-    true
-}
-
-impl Default for EditState {
-    fn default() -> Self {
-        EditState {
-            tool: Tool::Smart,
-            edit_mode: EditMode::Slip,
-            selection: Range::default(),
-            selected_tracks: Vec::new(),
-            selected_clips: Vec::new(),
-            playhead: 0,
-            grid: GridValue::default(),
-            nudge: GridValue::Seconds(1.0),
-            grid_lines: true,
-            main_counter: TimeFormat::MinSecs,
-            sub_counter: Some(TimeFormat::Samples),
-            zoom: ZoomState::default(),
-            rulers: vec!["bars_beats".into(), "min_secs".into(), "tempo".into(), "meter".into(), "markers".into()],
-            link_timeline_edit: true,
-            link_track_edit: false,
-            insertion_follows_playback: false,
-            loop_playback: false,
-            pre_post_roll: false,
-            pre_roll: 96_000,
-            post_roll: 96_000,
-            tab_to_transient: false,
-            automation_follows_edit: true,
-            markers_follow_edit: false,
-            layered_editing: false,
-            mirrored_midi: false,
-            click: false,
-            countoff: false,
-            countoff_bars: 2,
-            midi_merge: false,
-            record_mode: "normal".into(),
-            loop_record: false,
-            quickpunch: false,
-            scrolling: "page".into(),
-            solo_mode: "sip".into(),
-            pre_fader_metering: false,
-            delay_compensation: true,
-            keyboard_focus: "commands".into(),
-            timeline_selection: Range::default(),
-            flags: ["view.clip.name", "view.clip.gain_line", "waveform.peak", "view.clip.overlap_shadows", "view.marker.ruler_lines"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            values: std::collections::BTreeMap::new(),
-        }
-    }
-}
-
 /// The document.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Session {
@@ -287,12 +44,10 @@ pub struct Session {
     /// Timecode of sample 0 (session start), as a sample count.
     pub timecode_start: Samples,
     pub tempo: TempoMap,
-    #[serde(default)]
     pub key_signatures: Vec<(Samples, String)>,
     pub tracks: Vec<Track>,
     pub sources: Vec<Source>,
     /// Movies referenced by Video track clips.
-    #[serde(default)]
     pub videos: Vec<VideoSource>,
     pub busses: Vec<Bus>,
     pub outputs: Vec<OutputPath>,
@@ -300,11 +55,9 @@ pub struct Session {
     pub groups: Vec<Group>,
     pub edit: EditState,
     pub next_id: u64,
-    #[serde(default)]
     pub comments: String,
     /// Original MIDI performances keyed by clip id (Event › MIDI Operations › Restore/Flatten
     /// Performance). Independent of undo so a restore survives later edits.
-    #[serde(default)]
     pub midi_originals: std::collections::BTreeMap<u64, soundcraft_midi::Sequence>,
     #[serde(skip)]
     pub pool: SourcePool,
@@ -478,24 +231,6 @@ impl Session {
         ClipId(self.alloc())
     }
 
-    // ---- persistence ---------------------------------------------------------------------
-
-    pub fn to_json(&self) -> Result<String, SessionError> {
-        serde_json::to_string_pretty(self).map_err(|e| SessionError::Format(e.to_string()))
-    }
-
-    /// Parse a session; decoded audio must be attached separately (`pool`).
-    pub fn from_json(text: &str) -> Result<Session, SessionError> {
-        let v: serde_json::Value = serde_json::from_str(text).map_err(|e| SessionError::Format(e.to_string()))?;
-        let ver = v.get("format_version").and_then(serde_json::Value::as_u64).ok_or_else(|| SessionError::Format("missing format_version".into()))?;
-        if ver > u64::from(Self::FORMAT_VERSION) {
-            return Err(SessionError::Version(u32::try_from(ver).unwrap_or(u32::MAX)));
-        }
-        let mut s: Session = serde_json::from_value(v).map_err(|e| SessionError::Format(e.to_string()))?;
-        s.sanitize();
-        Ok(s)
-    }
-
     /// Repair invariants after loading untrusted data.
     pub fn sanitize(&mut self) {
         let max_id = self
@@ -590,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn video_clip_round_trips_and_old_sessions_load() {
+    fn video_clip_round_trips_and_trims() {
         let mut s = Session::default();
         let t = s.add_track(TrackKind::Video, ChannelFormat::Mono, None);
         let vid = SourceId(s.alloc());
@@ -617,7 +352,7 @@ mod tests {
         // A session written before video support has no `videos` key.
         let mut v = serde_json::to_value(Session::default()).unwrap();
         v.as_object_mut().unwrap().remove("videos");
-        assert!(Session::from_json(&v.to_string()).unwrap().videos.is_empty());
+        assert!(Session::from_json(&v.to_string()).is_err());
         // Trimming the start keeps the picture anchored.
         let mut c = c.clone();
         c.trim_start_to(100);
@@ -625,10 +360,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_garbage_and_future_versions() {
+    fn rejects_garbage_and_unsupported_versions() {
         assert!(Session::from_json("not json").is_err());
         assert!(Session::from_json("{}").is_err());
         let mut v = serde_json::to_value(Session::default()).unwrap();
+        v["format_version"] = serde_json::json!(0);
+        assert!(matches!(Session::from_json(&v.to_string()), Err(SessionError::Version(0))));
         v["format_version"] = serde_json::json!(999);
         assert!(matches!(Session::from_json(&v.to_string()), Err(SessionError::Version(999))));
     }

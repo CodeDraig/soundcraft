@@ -29,6 +29,11 @@ fn handshake_and_tool_list() {
     let mut s = Server::new(Headless::new(Engine::default()));
     let r = rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
     assert_eq!(r["result"]["serverInfo"]["name"], "soundcraft");
+    assert_eq!(r["result"]["protocolVersion"], "2025-06-18");
+    for version in ["2025-03-26", "2024-11-05", "unknown"] {
+        let r = rpc(&mut s, 1, "initialize", json!({"protocolVersion": version}));
+        assert_eq!(r["result"]["protocolVersion"], "2025-06-18");
+    }
     let r = rpc(&mut s, 2, "tools/list", json!({}));
     assert!(r["result"]["tools"].as_array().unwrap().len() >= 10);
     assert!(s.handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());

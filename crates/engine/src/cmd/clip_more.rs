@@ -1,12 +1,15 @@
 //! More Clip menu commands: Regroup, Unloop, Clip Effects bypass/render, Conform to Tempo and
 //! Remove Pitch Shift.
 
-use super::more_util::{render_stretched, replace_clip};
 use super::*;
 use crate::cmd;
-use serde_json::json;
-use soundcraft_model::{Clip, ClipContent, ClipId, Session, TrackId};
-use soundcraft_time::Samples;
+
+mod looping;
+use looping::{regroup, unloop};
+mod effects;
+use effects::{effects_bypass, effects_render, effects_set};
+mod elastic;
+use elastic::{conform, remove_pitch_shift};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -76,209 +79,12 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
-fn regroup(e: &mut Engine, p: &Value) -> Result<Value> {
-    let ids = clip_ids_param(e, p);
-    if ids.len() < 2 {
-        return Err(bad("clip.regroup", "select two or more clips"));
-    }
-    let s = e.session_mut();
-    let mut counts: std::collections::BTreeMap<u64, usize> = Default::default();
-    for id in &ids {
-        if let Some(g) = s.find_clip(*id).and_then(|(_, c)| c.group) {
-            *counts.entry(g).or_default() += 1;
-        }
-    }
-    let g = counts.iter().max_by_key(|(_, n)| **n).map(|(g, _)| *g).unwrap_or_else(|| s.alloc());
-    let mut n = 0;
-    for id in &ids {
-        if let Some(c) = s.find_clip_mut(*id) {
-            c.group = Some(g);
-            n += 1;
-        }
-    }
-    Ok(json!({"group": g, "clips": n}))
-}
-
-fn same_material(a: &Clip, b: &Clip) -> bool {
-    a.length == b.length
-        && match (&a.content, &b.content) {
-            (ClipContent::Audio { source: s1, offset: o1 }, ClipContent::Audio { source: s2, offset: o2 }) => s1 == s2 && o1 == o2,
-            (ClipContent::Midi { sequence: q1 }, ClipContent::Midi { sequence: q2 }) => q1 == q2,
-            (ClipContent::Video { source: s1, offset: o1 }, ClipContent::Video { source: s2, offset: o2 }) => s1 == s2 && o1 == o2,
-            _ => false,
-        }
-}
-
-/// The loop a clip belongs to: back-to-back copies of the same material. Origin first.
-fn loop_chain(s: &Session, t: TrackId, id: ClipId) -> Vec<ClipId> {
-    let Some(tr) = s.track(t) else { return Vec::new() };
-    let clips = tr.clips();
-    let Some(mut cur) = clips.iter().find(|c| c.id == id) else { return Vec::new() };
-    let mut guard = 0;
-    while let Some(prev) = clips.iter().find(|x| x.id != cur.id && x.end() == cur.start && same_material(x, cur)) {
-        cur = prev;
-        guard += 1;
-        if guard > clips.len() {
-            break;
-        }
-    }
-    let mut chain = vec![cur.id];
-    while let Some(next) = clips.iter().find(|x| !chain.contains(&x.id) && x.start == cur.end() && same_material(x, cur)) {
-        chain.push(next.id);
-        cur = next;
-    }
-    chain
-}
-
-fn unloop(e: &mut Engine, p: &Value) -> Result<Value> {
-    let id = "clip.unloop";
-    let remove = match str_param(p, "mode") {
-        None | Some("remove") => true,
-        Some("flatten") => false,
-        Some(m) => return Err(bad(id, format!("unknown mode `{m}`"))),
-    };
-    let ids = clip_ids_param(e, p);
-    let s = e.session_mut();
-    let mut done: Vec<ClipId> = Vec::new();
-    let mut gone: Vec<ClipId> = Vec::new();
-    let mut affected = 0;
-    for cid in ids {
-        if done.contains(&cid) {
-            continue;
-        }
-        let Some(t) = s.find_clip(cid).map(|(t, _)| t) else { continue };
-        let chain = loop_chain(s, t, cid);
-        done.extend(chain.iter().copied());
-        if chain.len() < 2 {
-            continue;
-        }
-        let copies: Vec<ClipId> = chain.iter().skip(1).copied().collect();
-        if let Some(pl) = s.track_mut(t).and_then(|tr| tr.playlist_mut()) {
-            if remove {
-                pl.clips.retain(|c| !copies.contains(&c.id));
-                gone.extend(copies.iter().copied());
-            } else {
-                for c in pl.clips.iter_mut().filter(|c| chain.contains(&c.id)) {
-                    c.group = None;
-                }
-            }
-        }
-        affected += copies.len();
-    }
-    if affected == 0 {
-        return Err(bad(id, "the selection is not a looped clip"));
-    }
-    s.edit.selected_clips.retain(|c| !gone.contains(c));
-    Ok(json!({"copies": affected, "removed": remove}))
-}
-
-fn effects_set(e: &mut Engine, p: &Value) -> Result<Value> {
-    let ids = clip_ids_param(e, p);
-    let params = p.get("params").and_then(Value::as_object).ok_or_else(|| bad("clip.effects_set", "`params` must be an object of numbers"))?;
-    let vals: Vec<(String, f64)> =
-        params.iter().filter_map(|(k, v)| v.as_f64().filter(|x| x.is_finite()).map(|x| (k.chars().take(64).collect(), x))).collect();
-    let s = e.session_mut();
-    for c in &ids {
-        for (k, v) in &vals {
-            s.edit.values.insert(format!("clip_fx.{}.{k}", c.0), *v);
-        }
-    }
-    Ok(json!({"clips": ids.len(), "params": vals.len()}))
-}
-
-fn effects_bypass(e: &mut Engine, p: &Value) -> Result<Value> {
-    let ids = clip_ids_param(e, p);
-    if ids.is_empty() {
-        return Err(bad("clip.effects_bypass", "select a clip"));
-    }
-    let s = e.session_mut();
-    let key = |c: &ClipId| format!("clip_fx.bypass.{}", c.0);
-    let on = p.get("value").and_then(Value::as_bool).unwrap_or_else(|| !ids.iter().all(|c| s.edit.flag(&key(c))));
-    for c in &ids {
-        s.edit.set_flag(&key(c), on);
-    }
-    Ok(json!({"bypass": on, "clips": ids.len()}))
-}
-
-fn effects_render(e: &mut Engine, p: &Value) -> Result<Value> {
-    let ids = clip_ids_param(e, p);
-    let mut n = 0;
-    for id in &ids {
-        if crate::io::render_clip_gain(e, *id)? {
-            n += 1;
-        }
-        let s = e.session_mut();
-        let pre = format!("clip_fx.{}.", id.0);
-        s.edit.values.retain(|k, _| !k.starts_with(&pre));
-        s.edit.set_flag(&format!("clip_fx.bypass.{}", id.0), false);
-        if let Some(c) = s.find_clip_mut(*id) {
-            c.fade_in.len = c.fade_in.len.min(c.length);
-            c.fade_out.len = c.fade_out.len.min(c.length);
-        }
-    }
-    Ok(json!({"rendered": n}))
-}
-
-fn conform(e: &mut Engine, p: &Value) -> Result<Value> {
-    let id = "clip.conform_to_tempo";
-    let ids = clip_ids_param(e, p);
-    let given = p.get("source_bpm").and_then(Value::as_f64).filter(|b| b.is_finite());
-    if let Some(b) = given
-        && !(5.0..=1000.0).contains(&b)
-    {
-        return Err(bad(id, "source_bpm must be 5..1000"));
-    }
-    let s = e.session_mut();
-    let mut out = Vec::new();
-    for cid in ids {
-        let Some((_, c)) = s.find_clip(cid).map(|(t, c)| (t, c.clone())) else { continue };
-        if !c.is_audio() || c.edit_locked {
-            continue;
-        }
-        let bpm_key = format!("clip.bpm.{}", cid.0);
-        let len_key = format!("clip.len0.{}", cid.0);
-        let stretch = if c.stretch.is_finite() && c.stretch > 0.0 { c.stretch } else { 1.0 };
-        let now = s.tempo.tempo_at_tick(s.tempo.samples_to_ticks(c.start, s.sample_rate));
-        let src_bpm = given.unwrap_or_else(|| s.edit.value(&bpm_key, now));
-        let len0 = s.edit.value(&len_key, c.length as f64 / stretch).max(1.0);
-        s.edit.values.insert(bpm_key, src_bpm);
-        s.edit.values.insert(len_key, len0);
-        let ratio = (src_bpm / now).clamp(0.05, 20.0);
-        let new_len = ((len0 * ratio).round() as Samples).max(1);
-        if let Some(cl) = s.find_clip_mut(cid) {
-            cl.stretch = ratio;
-            cl.length = new_len;
-            cl.fade_in.len = cl.fade_in.len.min(new_len);
-            cl.fade_out.len = cl.fade_out.len.min(new_len);
-        }
-        out.push(json!({"clip": cid, "source_bpm": src_bpm, "bpm": now, "stretch": ratio}));
-    }
-    Ok(json!({"clips": out}))
-}
-
-fn remove_pitch_shift(e: &mut Engine, p: &Value) -> Result<Value> {
-    let id = "clip.remove_pitch_shift";
-    let ids = clip_ids_param(e, p);
-    let s = e.session_mut();
-    let mut n = 0;
-    for cid in ids {
-        let Some((t, c)) = s.find_clip(cid).map(|(t, c)| (t, c.clone())) else { continue };
-        s.edit.values.remove(&format!("clip.pitch.{}", cid.0));
-        if !c.is_audio() || (c.stretch - 1.0).abs() < 1e-9 || !c.stretch.is_finite() {
-            continue;
-        }
-        let Some(src) = render_stretched(s, id, &c, c.length)? else { continue };
-        let mut nc = c.clone();
-        nc.content = ClipContent::Audio { source: src, offset: 0 };
-        nc.stretch = 1.0;
-        replace_clip(s, t, cid, nc);
-        n += 1;
-    }
-    Ok(json!({"clips": n}))
-}
-
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+    use soundcraft_model::{Clip, ClipId, Session, TrackId};
+    use soundcraft_time::Samples;
+
     use super::*;
     use soundcraft_model::{ChannelFormat, SourceId, TrackKind};
 

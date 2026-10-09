@@ -3,6 +3,9 @@
 SoundCraft speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio, so
 Claude and other agents can make music with it.
 
+The server negotiates protocol version `2025-06-18` only. An initialization request for another
+version receives this current version; clients must decide whether they support it.
+
 ```sh
 soundcraft-cli mcp                    # headless engine (no window, no audio device)
 soundcraft-cli mcp --demo             # headless, starting from the demo session

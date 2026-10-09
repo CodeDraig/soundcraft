@@ -7,6 +7,12 @@ use serde_json::{Value, json};
 use soundcraft_engine::Engine;
 use soundcraft_model::{ClipId, TrackId};
 
+mod paths;
+pub use paths::takes_path;
+use paths::{default_dir, path_dialog};
+mod audiosuite;
+use audiosuite::audiosuite_window;
+
 #[derive(Debug, Clone)]
 pub enum Dialog {
     NewTracks { count: u32, format: String, kind: String, timebase: String, name: String },
@@ -103,54 +109,6 @@ impl Dialogs {
             },
         });
         true
-    }
-}
-
-/// A path prompt for any command whose parameters start with a required `path` or `dir` (plus
-/// Print Score, whose path is optional), with a default file name from the command.
-pub fn takes_path(id: &str) -> bool {
-    path_key(id).is_some()
-}
-
-fn path_key(id: &str) -> Option<&'static str> {
-    let spec = soundcraft_engine::command_specs().iter().find(|c| c.id == id)?;
-    if spec.params.starts_with("{path?") && id != "file.print_score" {
-        None
-    } else if spec.params.starts_with("{path") {
-        Some("path")
-    } else if spec.params.starts_with("{dir") {
-        Some("dir")
-    } else {
-        None
-    }
-}
-
-fn path_dialog(id: &str, home: &str, name: &str) -> Option<Dialog> {
-    let spec = soundcraft_engine::command_specs().iter().find(|c| c.id == id)?;
-    let key = path_key(id)?;
-    let importing = id.contains("import") || id.contains("open");
-    let ext = match id {
-        "file.export_midi" => ".mid",
-        "file.export_sibelius" => ".musicxml",
-        "file.print_score" => ".svg",
-        "file.export_clip_groups" => ".scgrp",
-        "file.export_session_text" => ".txt",
-        _ if id.contains("session") => ".scraft",
-        _ => "",
-    };
-    let path = if importing || key == "dir" { format!("{home}/") } else { format!("{home}/{name}{ext}") };
-    let title = format!("{} — {}", spec.menu.last().copied().unwrap_or("File"), spec.label.trim_end_matches("..."));
-    Some(Dialog::PathPrompt { cmd: id.into(), title, path, key: key.into() })
-}
-
-fn default_dir() -> String {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".into())
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        String::new()
     }
 }
 
@@ -420,53 +378,6 @@ fn buttons(ui: &mut egui::Ui, ok: &str, enter: bool) -> bool {
         }
     });
     pressed
-}
-
-fn audiosuite_window(app: &mut SoundApp, ctx: &egui::Context) {
-    let Some(process) = app.ui.audiosuite.clone() else { return };
-    let mut open = true;
-    let title = soundcraft_dsp::plugin_info(&process).map_or_else(|| process.replace('_', " "), |p| p.name.to_string());
-    egui::Window::new(format!("AudioSuite · {title}")).open(&mut open).default_width(360.0).show(ctx, |ui| {
-        let key = egui::Id::new(("as_params", process.clone()));
-        let mut params: std::collections::BTreeMap<String, f32> = ui.ctx().memory(|m| m.data.get_temp(key)).unwrap_or_default();
-        if let Some(info) = soundcraft_dsp::plugin_info(&process) {
-            for p in info.params {
-                let v = params.entry(p.id.to_string()).or_insert(p.default);
-                ui.add(egui::Slider::new(v, p.min..=p.max).text(p.name));
-            }
-        } else {
-            match process.as_str() {
-                "normalize" => {
-                    let v = params.entry("target_db".into()).or_insert(-0.1);
-                    ui.add(egui::Slider::new(v, -24.0..=0.0).text("Peak dB"));
-                }
-                "time_stretch" => {
-                    let v = params.entry("ratio".into()).or_insert(1.0);
-                    ui.add(egui::Slider::new(v, 0.25..=4.0).text("Length ratio"));
-                }
-                "pitch_shift" => {
-                    let v = params.entry("semitones".into()).or_insert(0.0);
-                    ui.add(egui::Slider::new(v, -24.0..=24.0).text("Semitones"));
-                }
-                "varispeed" => {
-                    let v = params.entry("speed".into()).or_insert(1.0);
-                    ui.add(egui::Slider::new(v, 0.25..=4.0).text("Speed"));
-                }
-                _ => {
-                    ui.label("No parameters.");
-                }
-            }
-        }
-        ui.ctx().memory_mut(|m| m.data.insert_temp(key, params.clone()));
-        ui.label(egui::RichText::new("Processes the selected clips and replaces them with rendered audio.").small());
-        if ui.button(egui::RichText::new("Render").strong()).clicked() {
-            let p: serde_json::Map<String, Value> = params.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
-            let _ = app.run("audiosuite.process", json!({"process": process, "params": p}));
-        }
-    });
-    if !open {
-        app.ui.audiosuite = None;
-    }
 }
 
 #[cfg(test)]

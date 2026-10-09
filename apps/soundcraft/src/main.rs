@@ -11,8 +11,13 @@
 mod control_server;
 
 use soundcraft_engine::Engine;
-use soundcraft_ui_egui::{Services, SoundApp, UiState};
+use soundcraft_ui_egui::SoundApp;
 use std::sync::Arc;
+
+mod preferences;
+use preferences::{load_prefs, prefs_path, save_prefs};
+mod file_dialogs;
+use file_dialogs::services;
 
 struct App(SoundApp);
 
@@ -57,70 +62,6 @@ fn open_path(app: &mut SoundApp, p: &str) {
     }
 }
 
-fn prefs_path() -> Option<std::path::PathBuf> {
-    let base = if cfg!(target_os = "macos") {
-        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Library/Application Support/SoundCraft"))
-    } else if cfg!(windows) {
-        std::env::var_os("APPDATA").map(|a| std::path::PathBuf::from(a).join("SoundCraft"))
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-            .map(|c| c.join("soundcraft"))
-    };
-    base.map(|b| b.join("ui.json"))
-}
-
-fn load_prefs() -> Option<UiState> {
-    if std::env::var_os("SOUNDCRAFT_NO_PREFS").is_some() {
-        return None;
-    }
-    let bytes = std::fs::read(prefs_path()?).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn save_prefs(ui: &UiState) {
-    if std::env::var_os("SOUNDCRAFT_NO_PREFS").is_some() {
-        return;
-    }
-    if let Some(p) = prefs_path() {
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let mut ui = ui.clone();
-        ui.plugin_windows.clear();
-        ui.status.clear();
-        if let Ok(bytes) = serde_json::to_vec_pretty(&ui) {
-            let _ = std::fs::write(&p, bytes);
-        }
-    }
-}
-
-fn services() -> Services {
-    Services {
-        pick_open: Some(Box::new(|purpose: &str, _exts: &[&str]| {
-            let d = rfd::FileDialog::new();
-            let d = match purpose {
-                "session.open" => d.add_filter("SoundCraft Session", &["scraft"]),
-                "file.import_midi" => d.add_filter("MIDI", &["mid", "midi", "smf"]),
-                _ => d.add_filter(
-                    "Audio",
-                    &["wav", "wave", "bwf", "aif", "aiff", "aifc", "flac", "mp3", "ogg", "oga", "m4a", "aac", "mp4", "caf", "mkv", "webm"],
-                ),
-            };
-            d.pick_file().map(|p| p.to_string_lossy().into_owned())
-        })),
-        pick_save: Some(Box::new(|_purpose: &str, default: &str| {
-            let path = std::path::Path::new(default);
-            let mut d = rfd::FileDialog::new().add_filter("SoundCraft Session", &["scraft"]);
-            if let Some(n) = path.file_name().and_then(|n| n.to_str()) {
-                d = d.set_file_name(n);
-            }
-            d.save_file().map(|p| p.to_string_lossy().into_owned())
-        })),
-    }
-}
-
 /// The window, Dock, taskbar and Alt-Tab icon. macOS gets Apple's icon grid (transparent margin);
 /// elsewhere the full tile. Regenerate with `packaging/icons.sh`.
 fn app_icon() -> Option<egui::IconData> {
@@ -140,7 +81,7 @@ fn main() -> eframe::Result {
     if std::env::var_os("RUST_LOG").is_none() {
         // Quiet by default; `RUST_LOG=info` for more.
     }
-    let demo = args.iter().any(|a| a == "--demo" || a == "--sample");
+    let demo = args.iter().any(|a| a == "--demo");
     let no_audio = args.iter().any(|a| a == "--no-audio");
     let control_port: Option<u16> = args
         .iter()
@@ -151,7 +92,7 @@ fn main() -> eframe::Result {
     let files: Vec<String> = args
         .iter()
         .enumerate()
-        .filter(|(i, a)| !a.starts_with("--") && !(i > &0 && args.get(i - 1).is_some_and(|p| p == "--control")))
+        .filter(|(i, a)| !(a.starts_with("--") || i > &0 && args.get(i - 1).is_some_and(|p| p == "--control")))
         .map(|(_, a)| a.clone())
         .collect();
 

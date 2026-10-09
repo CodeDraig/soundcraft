@@ -202,35 +202,24 @@ pub struct Track {
     pub automation: Vec<AutomationLane>,
     /// Which lane the track shows: `waveform`/`blocks`/`notes`/`regions` or an automation param id.
     pub view: String,
-    #[serde(default)]
     pub hidden: bool,
-    #[serde(default)]
     pub inactive: bool,
-    #[serde(default)]
     pub frozen: bool,
-    #[serde(default)]
     pub comments: String,
     /// Folder that contains this track.
-    #[serde(default)]
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
     pub folder: Option<TrackId>,
-    #[serde(default = "yes")]
     pub folder_open: bool,
     /// Instrument plugin (instrument tracks) — registry id.
-    #[serde(default)]
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
     pub instrument: Option<crate::Insert>,
     /// Ticks (musical) or samples timebase for clips.
-    #[serde(default)]
     pub ticks_timebase: bool,
     /// Elastic Audio algorithm, if enabled.
-    #[serde(default)]
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
     pub elastic: Option<String>,
     /// Pinned to top in the Edit window.
-    #[serde(default)]
     pub pinned: bool,
-}
-
-fn yes() -> bool {
-    true
 }
 
 impl Track {

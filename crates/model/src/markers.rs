@@ -24,20 +24,14 @@ pub struct MemoryLocation {
     pub kind: MarkerKind,
     pub start: Samples,
     pub end: Samples,
-    #[serde(default)]
     pub comments: String,
-    #[serde(default)]
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
     pub color: Option<[u8; 3]>,
     /// Marker ruler lane 1..5.
-    #[serde(default = "one")]
     pub ruler: u8,
     /// Track-lane marker on this track, if any.
-    #[serde(default)]
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
     pub track: Option<TrackId>,
-}
-
-fn one() -> u8 {
-    1
 }
 
 /// A track group (Track › Group…).
@@ -53,6 +47,5 @@ pub struct Group {
     pub active: bool,
     pub color: [u8; 3],
     /// Shared attributes linked by the group (volume, mute, solo, rec, etc.).
-    #[serde(default)]
     pub attributes: Vec<String>,
 }

@@ -212,7 +212,10 @@ fn state_saves_component_and_controller_and_restores_them() {
 fn editor_view_is_probed_and_edits_come_back_as_plain_values() {
     let id = id_of("Fixture Gain");
     let mut p = soundcraft_vst3_host::instantiate_plugin(&id).unwrap();
+    #[cfg(target_os = "macos")]
     assert_eq!(p.editor_size(), Ok((320, 240)));
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(p.editor_size(), Err("plugin editors are not supported on this platform".into()));
     let mut ed = soundcraft_dsp::Plugin::editor(&mut p).expect("editor handle");
     // The fixture "edits" Gain to 0.9 (normalized) when it gets the component handler.
     assert_eq!(ed.idle(), vec![("7".to_string(), 1.8)]);

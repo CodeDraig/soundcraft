@@ -20,7 +20,13 @@ L6  ui-egui                                     (the user interface)
 (inserts, sends, routing, automation lanes), tempo and meter maps, memory locations, groups,
 busses, and `EditState` (selection, tools, modes, view flags). Decoded audio lives in a
 `SourcePool` of `Arc`s that is not serialised; cloning a session is cheap. Sessions save as
-`.scraft` JSON plus an `Audio Files/` folder.
+`.scraft` JSON plus an `Audio Files/` folder. Session and preset readers accept the current
+writer's format only: required fields must be present (including fields whose value is `null`),
+and session/track-preset version numbers must match the current version. Opaque insert state
+is optional because the current writer omits it for stateless plugins. Older incomplete JSON
+is rejected; there is no migration reader. Saved UI preferences and window configurations also
+require their complete current fields; `ui.set` remains a partial update merged into the current
+state before validation.
 
 ## Commands and undo
 

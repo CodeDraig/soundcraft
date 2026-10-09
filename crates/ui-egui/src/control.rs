@@ -3,7 +3,7 @@
 //! goes through exactly the same code as a click.
 //!
 //! Methods:
-//! - `engine.execute {command, params}` (alias `command`): run any command programmatically (no dialogs)
+//! - `engine.execute {command, params}`: run any command programmatically (no dialogs)
 //! - `engine.commands {filter?}`, `engine.parity`, `session.inspect {detail?}`, `ui.inspect`
 //! - `ui.menu.list`, `ui.menu.invoke {path: "Track > New..." | id}` (menu-style: may open dialogs)
 //! - `ui.click {x,y,button?,count?,mods?}`, `ui.move {x,y}`, `ui.drag {x,y,to_x,to_y,steps?}`
@@ -14,6 +14,10 @@
 use crate::SoundApp;
 use serde_json::{Value, json};
 use std::sync::mpsc::{Receiver, Sender, channel};
+
+mod screenshots;
+use screenshots::request_screenshot;
+pub use screenshots::{PendingShot, collect_screenshots, png_bytes};
 
 pub struct ControlRequest {
     pub method: String,
@@ -26,15 +30,6 @@ impl ControlRequest {
         let (tx, rx) = channel();
         (ControlRequest { method: method.into(), params, reply: tx }, rx)
     }
-}
-
-pub struct PendingShot {
-    token: u64,
-    reply: Sender<Value>,
-    path: Option<String>,
-    frames: u32,
-    sent: bool,
-    deadline_frames: u32,
 }
 
 fn ok(v: Value) -> Value {
@@ -78,7 +73,7 @@ fn key_from(name: &str) -> Option<egui::Key> {
 
 fn mods(p: &Value) -> egui::Modifiers {
     let b = |k: &str| p.get(k).and_then(Value::as_bool).unwrap_or(false);
-    let cmd = b("cmd") || b("command");
+    let cmd = b("cmd");
     egui::Modifiers {
         alt: b("alt"),
         ctrl: b("ctrl") || (cmd && !cfg!(target_os = "macos")),
@@ -92,8 +87,8 @@ fn handle(app: &mut SoundApp, ctx: &egui::Context, req: &ControlRequest) -> Opti
     let p = &req.params;
     let f = |k: &str| p.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32;
     Some(match req.method.as_str() {
-        "engine.execute" | "command" => {
-            let id = p.get("command").or_else(|| p.get("id")).and_then(Value::as_str).unwrap_or("");
+        "engine.execute" => {
+            let id = p.get("command").and_then(Value::as_str).unwrap_or("");
             let params = p.get("params").cloned().unwrap_or(json!({}));
             match app.run(id, params) {
                 Ok(v) => ok(v),
@@ -113,9 +108,7 @@ fn handle(app: &mut SoundApp, ctx: &egui::Context, req: &ControlRequest) -> Opti
             ok(list)
         }
         "engine.parity" => ok(crate::menus::parity()),
-        "session.inspect" | "document.inspect" => {
-            ok(soundcraft_engine::inspect::session(&app.engine, p.get("detail").and_then(Value::as_str) == Some("full")))
-        }
+        "session.inspect" => ok(soundcraft_engine::inspect::session(&app.engine, p.get("detail").and_then(Value::as_str) == Some("full"))),
         "ui.inspect" => {
             let mut v = app.inspect(ctx);
             v["edit_layout"] = json!(app.edit_layout);
@@ -193,17 +186,7 @@ fn handle(app: &mut SoundApp, ctx: &egui::Context, req: &ControlRequest) -> Opti
             ok(json!({}))
         }
         "ui.screenshot" => {
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-            let token = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            app.pending_shots.push(PendingShot {
-                token,
-                reply: req.reply.clone(),
-                path: p.get("path").and_then(Value::as_str).map(str::to_string),
-                frames: 0,
-                sent: false,
-                deadline_frames: 600,
-            });
-            ctx.request_repaint();
+            request_screenshot(app, ctx, req);
             return None;
         }
         "app.quit" => {
@@ -214,96 +197,49 @@ fn handle(app: &mut SoundApp, ctx: &egui::Context, req: &ControlRequest) -> Opti
     })
 }
 
-/// Request and collect viewport screenshots for pending `ui.screenshot` calls.
-pub fn collect_screenshots(app: &mut SoundApp, ctx: &egui::Context) {
-    if app.pending_shots.is_empty() {
-        return;
-    }
-    let images: Vec<(u64, std::sync::Arc<egui::ColorImage>)> = ctx.input(|i| {
-        i.raw
-            .events
-            .iter()
-            .filter_map(|e| match e {
-                egui::Event::Screenshot { user_data, image, .. } => {
-                    user_data.data.as_ref().and_then(|d| d.downcast_ref::<u64>()).map(|t| (*t, image.clone()))
-                }
-                _ => None,
-            })
-            .collect()
-    });
-    let mut keep = Vec::new();
-    for mut s in std::mem::take(&mut app.pending_shots) {
-        if let Some((_, img)) = images.iter().find(|(t, _)| *t == s.token) {
-            let _ = s.reply.send(encode(img, s.path.as_deref()));
-            continue;
-        }
-        s.frames += 1;
-        if !s.sent && s.frames >= 3 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(s.token)));
-            s.sent = true;
-        }
-        if s.frames > s.deadline_frames {
-            let _ = s.reply.send(err("no frame was presented (is the window visible?)"));
-            continue;
-        }
-        keep.push(s);
-    }
-    app.pending_shots = keep;
-    ctx.request_repaint();
-}
-
-pub fn png_bytes(img: &egui::ColorImage) -> Result<Vec<u8>, String> {
-    let [w, h] = img.size;
-    let mut raw = Vec::with_capacity(w * h * 4);
-    for c in &img.pixels {
-        raw.extend_from_slice(&c.to_array());
-    }
-    let buf = image::RgbaImage::from_raw(u32::try_from(w).map_err(|e| e.to_string())?, u32::try_from(h).map_err(|e| e.to_string())?, raw)
-        .ok_or("bad image size")?;
-    let mut out = std::io::Cursor::new(Vec::new());
-    buf.write_to(&mut out, image::ImageFormat::Png).map_err(|e| e.to_string())?;
-    Ok(out.into_inner())
-}
-
-fn encode(img: &egui::ColorImage, path: Option<&str>) -> Value {
-    let bytes = match png_bytes(img) {
-        Ok(b) => b,
-        Err(e) => return err(e),
-    };
-    match path {
-        Some(p) => match std::fs::write(p, &bytes) {
-            Ok(()) => ok(json!({"path": p, "width": img.size[0], "height": img.size[1]})),
-            Err(e) => err(format!("{p}: {e}")),
-        },
-        None => ok(json!({"png_base64": base64(&bytes), "width": img.size[0], "height": img.size[1]})),
-    }
-}
-
-/// Minimal base64 (standard alphabet) to avoid another dependency.
-pub fn base64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk.first().copied().unwrap_or(0), chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                let idx = ((n >> (18 - 6 * i)) & 63) as usize;
-                out.push(char::from(T.get(idx).copied().unwrap_or(b'A')));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn base64_known() {
-        assert_eq!(super::base64(b"Man"), "TWFu");
-        assert_eq!(super::base64(b"Ma"), "TWE=");
-        assert_eq!(super::base64(b"M"), "TQ==");
+    fn control_uses_current_method_and_command_field() {
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, crate::Services::default());
+        let ctx = egui::Context::default();
+        for (method, params) in
+            [("command", json!({"command": "track.new"})), ("document.inspect", json!({})), ("engine.execute", json!({"id": "track.new"}))]
+        {
+            let (req, _) = ControlRequest::new(method, params);
+            assert_eq!(handle(&mut app, &ctx, &req).unwrap()["ok"], false);
+        }
+        assert!(app.engine.session().tracks.is_empty());
+        let (req, _) = ControlRequest::new("engine.execute", json!({"command": "track.new", "params": {}}));
+        assert_eq!(handle(&mut app, &ctx, &req).unwrap()["ok"], true);
+        assert_eq!(app.engine.session().tracks.len(), 1);
+    }
+
+    #[test]
+    fn current_preferences_require_fields_but_ui_updates_remain_partial() {
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, crate::Services::default());
+        let current = serde_json::to_value(&app.ui).unwrap();
+        let restored: crate::UiState = serde_json::from_value(current.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), current);
+        for field in current.as_object().unwrap().keys() {
+            let mut incomplete = current.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<crate::UiState>(incomplete).is_err(), "accepted missing {field}");
+        }
+        let ops = serde_json::to_value(&app.ops).unwrap();
+        assert!(serde_json::from_value::<crate::ops_windows::OpsState>(ops.clone()).is_ok());
+        for field in ops.as_object().unwrap().keys() {
+            let mut incomplete = ops.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<crate::ops_windows::OpsState>(incomplete).is_err(), "accepted missing {field}");
+        }
+        let ctx = egui::Context::default();
+        let (req, _) = ControlRequest::new("ui.set", json!({"window": "Mix"}));
+        assert_eq!(handle(&mut app, &ctx, &req).unwrap()["ok"], true);
+        let mut expected = current;
+        expected["window"] = json!("Mix");
+        assert_eq!(serde_json::to_value(&app.ui).unwrap(), expected);
     }
 }

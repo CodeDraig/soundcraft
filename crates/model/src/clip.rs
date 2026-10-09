@@ -18,7 +18,7 @@ pub enum FadeShape {
 impl FadeShape {
     pub const ALL: [FadeShape; 5] = [FadeShape::Linear, FadeShape::EqualPower, FadeShape::SCurve, FadeShape::Exponential, FadeShape::Logarithmic];
 
-    /// Fade-in gain at `t` ∈ [0,1] (fade-outs use `gain(1 - t)`).
+    /// Fade-in gain at `t` ∈ `[0,1]` (fade-outs use `gain(1 - t)`).
     pub fn gain(self, t: f32) -> f32 {
         let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
         match self {
@@ -76,39 +76,25 @@ pub struct Clip {
     pub length: Samples,
     pub content: ClipContent,
     /// Static clip gain in dB.
-    #[serde(default)]
     pub gain_db: f32,
     /// Clip gain envelope breakpoints: (offset from clip start, dB). Empty = flat `gain_db`.
-    #[serde(default)]
     pub gain_env: Vec<(Samples, f32)>,
-    #[serde(default)]
     pub fade_in: Fade,
-    #[serde(default)]
     pub fade_out: Fade,
-    #[serde(default)]
     pub muted: bool,
-    #[serde(default)]
     pub edit_locked: bool,
-    #[serde(default)]
     pub time_locked: bool,
-    #[serde(default)]
     pub rating: u8,
     /// Sync point offset from clip start.
-    #[serde(default)]
     pub sync_point: Samples,
     /// Optional colour override (RGB).
-    #[serde(default)]
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
     pub color: Option<[u8; 3]>,
     /// Elastic / Vari-speed ratio (1.0 = none) — applied by rendered processing.
-    #[serde(default = "one")]
     pub stretch: f64,
     /// Reversed playback (AudioSuite Reverse renders into a new source; this is for previews).
-    #[serde(default)]
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
     pub group: Option<u64>,
-}
-
-fn one() -> f64 {
-    1.0
 }
 
 impl Clip {
