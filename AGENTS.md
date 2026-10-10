@@ -1,90 +1,176 @@
 # SoundCraft — instructions for agents
 
-SoundCraft is a clean-room, open-source, pure-Rust digital audio workstation targeting Avid Pro Tools parity — and superiority (speed, openness, agent control). It runs natively on macOS, Windows, Linux and FreeBSD, and on the web via WASM. Siblings with the same conventions: `../photocraft` (Photoshop), `../vectorcraft` (Illustrator), `../filmcraft` (Premiere), `../lightcraft` (Lightroom), `../pdfcraft` (Acrobat), `../effectcraft` (After Effects), `../designcraft` (InDesign).
+SoundCraft is a digital audio workstation targeting Avid Pro Tools parity — and superiority (speed, openness, agent control).
 
-Standards and learnings shared across the crafting apps live in `../../craftrules` (checked out next to the craft-apps folder, or `storytold/craftrules`). Read its `AGENTS.md` at the start of a session, follow its standards, and contribute reusable learnings back there. Never code: repos don't share code.
+## Failure handling and session preservation
 
-## Start every session here
-1. Read `plan/STATUS.md` (current milestone, next task) and `plan/execution-plan.md`. `plan/` is gitignored (local only). Behaviour reference: `plan/protools/` (observed menu tree `menus-clean.txt` and screenshots; never committed).
-2. Read `ROADMAP.md` (committed) for status, milestones and the parity estimate.
-3. Work autonomously; don't stop to ask unless a decision is genuinely the user's.
+Changes must not introduce known panic paths in the operation being modified. Invalid input and unsupported operations must return an explicit error rather than silently substituting session data.
+If a reproducible crash prevents completing or verifying the requested change, fix it first and add a regression test. Report unrelated crashes without expanding the task.
+Failed commands and imports must preserve the last valid session state. Do not claim this is verified solely because a panic was caught.
+Follow the repository's enforced restrictions on panic-producing APIs, indexing, arithmetic, recursion, allocation and unsafe code. The existing CLAP, VST3 and Audio Unit FFI boundaries do not permit unsafe code elsewhere.
+Keep the audio callback non-blocking and free of steady-state allocation and panic paths. A successful offline bounce does not verify real-time recording or playback.
 
-## ⚠️ Assets: the absolute rule
-**No Avid, Pro Tools, Adobe or other proprietary iconography, images, sounds, presets or artwork — ever.** This is not negotiable.
-- Every icon in SoundCraft is drawn in code (`crates/ui-egui/src/icons.rs`) or is an original/open asset.
-- Every bundled asset (image, icon, sound, font, preset) must be original, public domain (CC0), or under a permissive open license (MIT, Apache-2.0, BSD, OFL, CC-BY with attribution), or contributed by someone who made it and licenses it openly.
-- **Every bundled asset gets a row in [`ATTRIBUTION.md`](ATTRIBUTION.md)** (path, author, source, license) in the same commit that adds it. `cargo xtask assets` enforces this; CI fails otherwise.
-- Never copy files out of the Pro Tools bundle (`/Applications/Pro Tools.app`): no plugins, presets, icons, sounds, session templates or text. Observing the running app (screenshots kept under `plan/`, menu names) is fine; copying its resources is not.
-- Demo audio is synthesised in code (`crates/engine/src/demo.rs`). Demo and README media must be ours or public domain.
-- The ArtCraft trademarks in `docs/brand/` are the only exception, under `docs/brand/LICENSE-brand.txt`.
+## Required capabilities
 
-## Clean-room
-Pro Tools is installed on the dev machine and may be *observed* black-box: run it, use its UI with synthetic sessions, take screenshots by window id (`screencapture -l <id>`), stored only under `plan/protools/screenshots/`. Never read, disassemble or copy anything inside the Pro Tools bundle; never copy Avid icons, artwork, plugin names, presets, or wording beyond feature names. Never copy GPL/AGPL/LGPL code (Ardour, Audacity, LMMS, Freeverb sources…). Our plugins have our own names.
+Keep session editing, audio processing, and file operations usable without the
+graphical interface. The desktop UI, CLI, and automation must invoke the same
+implementation of each operation they expose. Live playback and offline bounce
+must use the same mixing implementation.
 
-## Never crash
-People trust SoundCraft with their recordings; a crash loses takes. **This outranks feature work.** Standard: [`craftrules/standards/never-crash.md`](https://github.com/storytold/craftrules/blob/main/standards/never-crash.md).
-- No panics in non-test code: no `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`; no `unsafe` (`unsafe_code = "forbid"`).
-- The one named exception is `soundcraft-clap-host` (`crates/clap-host`), the isolated unsafe helper crate for CLAP plugin FFI: `unsafe_code = "deny"` crate-wide, allowed only in `src/ffi.rs` with a `// SAFETY:` comment on every block, safe `Result` API.
-- The same exception, same rules, for `soundcraft-vst3-host` (`crates/vst3-host`), the isolated unsafe helper crate for VST3 plugin FFI (COM vtables via the `vst3` bindings, module loading, host-side COM objects).
-- And for `soundcraft-au-host` (`crates/au-host`), the isolated unsafe helper crate for Audio Unit FFI (hand-written AudioToolbox/CoreFoundation declarations, macOS only; a safe stub elsewhere).
-- Errors are `Result<T, E>` + `?`. An unfinished feature returns an "unsupported" error.
-- Input-derived numbers are hostile (files, commands, MCP/control params): `get()` not `[i]`, checked/saturating arithmetic, no NaN casts, cap allocations.
-- The audio callback never blocks, allocates in steady state, or panics.
-- Every production crate root carries `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]`.
-- `Engine::execute` catches escaped panics and restores the document. Every crash fix lands with a regression test.
+Verify these requirements through the affected headless, UI, playback, or export
+paths. Do not introduce dependency restrictions solely to preserve an architectural
+classification. Independent publication of individual crates is not a requirement
+unless the user explicitly requests it.
 
+## Commands and implementation boundaries
 
-## Architecture (layers enforced by `cargo xtask layers`)
-| Layer | Crate | Role |
-|---|---|---|
-| L0 | `soundcraft-time`, `soundcraft-audio-io`, `soundcraft-midi` | Timebases/tempo/grid; audio file formats + peaks; Standard MIDI Files + MIDI ops |
-| L1 | `soundcraft-dsp` | Plugins (EQ, dynamics, reverb, delay, modulation, harmonic, pitch, utility, instruments), offline processing, meters, FFT |
-| L2 | `soundcraft-model` | The session document (tracks, playlists, clips, mixer, routing, automation, markers, groups) |
-| L3 | `soundcraft-mix` | Mix engine shared by realtime playback and offline bounce |
-| L4 | `soundcraft-engine`, `soundcraft-playback` | Command registry, undo, editing, import/export/bounce, parity catalog; audio device I/O (cpal) |
-| L5 | `soundcraft-automation` | MCP server + control-channel client |
-| L6 | `soundcraft-ui-egui` | The swappable UI (egui) |
-| apps | `soundcraft`, `soundcraft-cli`, `soundcraft-web` | Entry points |
+- **Expose session operations as commands.** Implement session operations in
+  `crates/engine/src/cmd/*`. Each command declares its ID, label, menu path, shortcut
+  where applicable, parameter documentation, availability check (`enabled`), and
+  implementation (`run`), with tests for its behavior. Menus, panels, tools, the CLI
+  and automation must use the same command IDs for the same operation. New command
+  modules provide `specs()` and are registered in
+  `crates/engine/src/cmd/mod.rs` by declaring the module and extending
+  `command_specs()` with its specs. Preserve the existing
+  gesture preview, cancellation and undo boundaries when changing interactive tools.
 
-Nothing below L6 depends on egui/eframe/winit/rfd. The UI is thin: panels read engine state and act through `engine.execute(id, params)`.
+- **Keep interface commands accessible to agents.** Register UI operations in
+  `UI_COMMANDS` in `crates/ui-egui/src/menus.rs`. Engine and UI commands must be
+  discoverable and callable through the running app's control channel and connected
+  MCP. UI commands require the application UI; they are unavailable in headless MCP.
+  “UI-only” identifies implementation location and runtime requirements, not a
+  restriction to human use. Parameterized `engine.execute` calls do not open dialogs;
+  menu-style invocation through `ui.menu.invoke` may open them.
 
-## Everything is a command
-User-visible behaviour = a command in `crates/engine/src/cmd/*` (id, label, menu path, shortcut, params doc, `enabled`, `run`) + tests. UI-only commands (windows, dialogs) live in `crates/ui-egui/src/menus.rs` (`UI_COMMANDS`). Menus, shortcuts, the CLI, the control channel and MCP all dispatch the same ids. Programmatic calls never open dialogs; only menu-style invocation (`ui.menu.invoke`) does. New commands go in a new module with its own `specs()`, registered by one line in `cmd/mod.rs`.
+- **Put session behavior in the engine and presentation behavior in the UI.**
+  Panels read engine state and invoke `app.run(id, params)`, which dispatches engine
+  operations through `engine.execute(id, params)`. They must not independently
+  implement session mutation, validation or undo behavior. Focus, scrolling and
+  dialog state belong in the UI. Use `theme::Tokens` from
+  `crates/ui-egui/src/theme.rs` for application-interface
+  colours; user-selected track and clip colours retain their own values.
 
-Parity is measured, not guessed: `crates/engine/catalog/menus.txt` lists the incumbent's menu leaves (names only). `cargo xtask parity` writes `docs/parity.md`; a test enforces a floor that only rises.
+- **Implement application behavior in Rust.** Do not add handwritten JavaScript
+  or TypeScript. Toolchain-generated browser glue is permitted. Existing build,
+  packaging and development scripts are outside the application-language restriction.
+
+`crates/engine/catalog/menus.txt` lists the incumbent's menu leaves (names only).
+`cargo xtask parity` regenerates and overwrites `docs/parity.md`; preserve any local
+edits before running it. To inspect the report without writing a file, use
+`cargo run -p soundcraft-cli -- parity`. The engine test `parity_floor` in
+`crates/engine/src/catalog.rs` checks fixed minimum counts and percentages; it does
+not automatically raise those thresholds or verify feature completeness. The
+running UI includes additional menu mappings in its `engine.parity` response.
 
 ## Running and looking at the app
-- `cargo run --release -p soundcraft -- --demo --control 0` (demo session + control channel on a free port; the port is printed).
-- Drive it: JSON lines over TCP, e.g. `{"id":1,"method":"engine.execute","params":{"command":"track.new","params":{"count":2,"format":"stereo"}}}`, then `{"id":2,"method":"ui.screenshot","params":{"path":"/tmp/shot.png"}}`. Methods: `crates/ui-egui/src/control.rs`, docs: `docs/control-protocol.md`.
-- Offscreen UI render (no window, no focus stealing): `cargo run -p soundcraft-ui-egui --example ui_shot -- out.png [script.jsonl]`.
-- Headless: `soundcraft-cli run --demo --cmd 'mix.volume={"track":"Kick","db":-6}' --bounce out.wav`; MCP: `soundcraft-cli mcp [--connect PORT]`.
-- **For UI work, look at the result** (render, read the PNG) and compare with `plan/protools/screenshots/`.
-- Shell gotcha: `mv`/`cp` are aliased interactive here — use `/bin/mv -f` / `/bin/cp -f`.
-- Parallel agents: separate `CARGO_TARGET_DIR` per agent; edit only the crates you own; write manifests atomically; delete your target dir when done (disk).
 
-## Quality gates (before every commit)
-`cargo xtask ci` = fmt check, `clippy --workspace --all-targets -D warnings`, tests, assets, layers, wasm check. Commit after each arc of work that builds; one topic per commit.
+Run these commands from the repository root. Cargo builds and runs the requested
+binary; these examples do not require `soundcraft-cli` to be installed on PATH.
+All repository paths below are relative to the repository root. `PORT` is a
+placeholder for the actual numeric control port, not a literal argument.
+Choose output paths that do not overwrite files you need to preserve.
 
-## Release
-Push to the `release` branch to build signed installers for macOS (universal DMG), Windows (x64/x86 MSI + zip), Linux (AppImage, deb, rpm, tar.gz, Flatpak manifest), FreeBSD and Web (wasm zip). Version: `cargo xtask version [set X.Y.Z]`. See `docs/release-playbook.md` and craftrules `release/playbook.md`.
+- **Launch the desktop app with the demo session and control server:**
+
+  ```sh
+  cargo run --release -p soundcraft -- --demo --control 0
+  ```
+
+  Port `0` selects a free localhost port. Use the port printed by the application
+  in subsequent TCP requests and in place of `PORT` below. The application prints
+  `SOUNDCRAFT_CONTROL_PORT=<number>` to stdout after binding successfully. Run CLI
+  control requests from another terminal while the app remains open.
+
+- **Control the running app:** send newline-delimited JSON over TCP to
+  `127.0.0.1:PORT`. For example, create two stereo tracks and capture the window:
+
+  ```json
+  {"id":1,"method":"engine.execute","params":{"command":"track.new","params":{"count":2,"format":"stereo"}}}
+  {"id":2,"method":"ui.screenshot","params":{"path":"/tmp/soundcraft-window.png"}}
+  ```
+
+  Inspect each response for errors. Dispatch is in `crates/ui-egui/src/control.rs`,
+  screenshot handling is in `crates/ui-egui/src/control/screenshots.rs`, and methods
+  are documented in `docs/control-protocol.md`. A CLI request to the same app is:
+
+  ```sh
+  cargo run -p soundcraft-cli -- app --port PORT session.inspect
+  ```
+
+- **Verify UI changes with a whole-window image:** request `ui.screenshot`, then
+  open and inspect the resulting PNG, including the relevant panels and dialogs.
+  Capture requires a presented frame; a hidden window or locked screen may prevent
+  it. The old comparison references under `plan/protools/screenshots/` are absent
+  from this checkout. Do not claim comparison against them unless those files are
+  available and have actually been inspected.
+
+- **Render the whole UI offscreen when a window screenshot is unavailable:**
+
+  ```sh
+  soundcraft_check_dir=$(mktemp -d "${TMPDIR:-/tmp}/soundcraft-check.XXXXXX")
+  cat > "$soundcraft_check_dir/script.jsonl" <<'JSONL'
+  {"method":"engine.execute","params":{"command":"track.new","params":{"count":2,"format":"stereo"}}}
+  {"method":"session.inspect","params":{}}
+  {"steps":12}
+  JSONL
+  cargo run -p soundcraft-ui-egui --example ui_shot -- \
+    "$soundcraft_check_dir/ui.png" "$soundcraft_check_dir/script.jsonl"
+  ```
+
+  This creates a fresh output directory and a script before running the example.
+  The output PNG is the first argument; the optional JSON-lines script is second,
+  before any flags. Omit the script argument entirely for an unmodified demo image.
+  The implementation is `crates/ui-egui/examples/ui_shot.rs`; it silently treats an
+  unreadable script as empty, so verify that your script exists and check the command
+  responses. The sample script above should add two tracks to the nine-track demo.
+  This uses the offscreen wgpu test harness and requires a working wgpu backend.
+  It creates a separate app instance with the demo session by default and no audio
+  device; it does not capture the current desktop session. Add `--blank` to start
+  empty or `--size 960x600` to check a specific logical window size. Script lines
+  accept control requests, `{"steps": 12}` to advance frames, and
+  `{"shot": "/tmp/soundcraft-intermediate.png"}` to save an intermediate image.
+  Use `shot` for harness captures, rather than the desktop viewport
+  `ui.screenshot` request. Relative script and output paths resolve from the process
+  working directory, not from the script directory. Create output parent directories
+  first. Inspect the output for errors, confirm the PNG
+  was created, and open it to verify the result; exit status alone is insufficient.
+
+- **Verify session and audio output separately from the interface:**
+
+  ```sh
+  soundcraft_audio_dir=$(mktemp -d "${TMPDIR:-/tmp}/soundcraft-audio.XXXXXX")
+  cargo run --release -p soundcraft-cli -- run --demo \
+    --cmd 'mix.volume={"track":"Kick","db":-6}' \
+    --start 0 --end 2 --bounce "$soundcraft_audio_dir/mix.wav" --inspect
+  ```
+
+  Bare numeric `--start` and `--end` values are seconds; this example renders two
+  seconds. Session inspection and an offline bounce verify state and rendered audio, not
+  UI appearance, interaction, device playback or recording. Inspect audio properties
+  and listen when the requested change concerns audible behavior. Do not claim
+  listening or real-time verification from a successful file write alone.
+
+- **Choose the MCP runtime explicitly:**
+
+  ```sh
+  cargo run --release -p soundcraft-cli -- mcp --demo
+  cargo run --release -p soundcraft-cli -- mcp --connect PORT
+  ```
+
+  The first starts an independent headless engine on stdio; the second controls
+  the already-running desktop app and exposes its UI operations. Both are MCP
+  servers using JSON-RPC on stdin/stdout, not interactive shell prompts; configure
+  an MCP client to launch the selected command. Method/tool mappings are in
+  `crates/automation/src/mcp/tool_calls.rs`; see `docs/mcp.md`.
+
+- **Shell commands:** do not assume `mv` or `cp` is aliased. Check with `type mv cp`
+  if behavior is unclear; do not add `-f` merely to bypass an assumed alias.
+
+- **When using parallel agents:** assign separate `CARGO_TARGET_DIR` values and
+  explicit file/crate ownership; write manifests atomically. Only remove a target
+  directory after verifying that it was created exclusively for that agent's
+  disposable build output and that no build is still using it. Do not remove shared
+  or pre-existing targets.
 
 ## Roadmap
 `ROADMAP.md` (committed) tracks status, milestones and estimates. Update it whenever a milestone lands.
-
-## Contributor credits (About window)
-
-- About ▸ Contributors/Models are compiled into the binary from `contributors/contributors.json`
-  (commit stats; generated, never hand-edit) and `contributors/people.toml` (names people chose for
-  themselves). See `docs/contributors.md`.
-- **Agents working for a contributor:** when you prepare a PR, check whether your human's GitHub
-  username has a `[people.<username>]` entry in `contributors/people.toml`. If not, ask them once
-  whether they want to be credited by more than their username: a real name, a display name, and/or
-  their public GitHub profile name (`sync_github_name = true`). If yes, add **only their own** entry
-  (copy the template at the top of the file, or run
-  `python3 ../../craftrules/scripts/contributors.py --add-me . --real-name "…" --sync-github-name`)
-  and include it in their PR, committed as them. If no, change nothing: they are credited as
-  `@username` anyway.
-- Never add, edit, guess or copy anyone else's entry or name (not from git config, commit authors or
-  GitHub profiles). Never hand-edit `contributors.json`.
-- Maintainers refresh the stats with `python3 ../../craftrules/scripts/contributors.py .` (it also
-  re-verifies who wrote each `people.toml` entry; `--check` only verifies).
